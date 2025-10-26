@@ -2,8 +2,9 @@ import asyncio
 import aiohttp
 import time
 import os
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -14,6 +15,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "").split(",")
 PORT = int(os.getenv("PORT", 8443))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+ACCESS_CODE = os.getenv("ACCESS_CODE", "")  # NEW: Access code for bot usage
+
+# Conversation state
+WAITING_FOR_CODE = 1
+
+# Store authorized users and stats
+authorized_users = set()  # Users who entered correct access code
+user_stats = {}  # Store stats per user: {user_id: {"bombs": 0, "authorized_at": datetime}}
+global_stats = {
+    "total_bombs": 0,
+    "total_otps_sent": 0,
+    "bot_started_at": datetime.now()
+}
 
 # Simplified API configs (5 APIs for educational purposes)
 API_CONFIGS = [
@@ -76,6 +90,30 @@ API_CONFIGS = [
 active_sessions = {}
 
 # ===== HELPER FUNCTIONS =====
+def is_authorized(user_id):
+    """Check if user is authorized"""
+    return str(user_id) in authorized_users
+
+def authorize_user(user_id):
+    """Authorize a user"""
+    user_id_str = str(user_id)
+    authorized_users.add(user_id_str)
+    if user_id_str not in user_stats:
+        user_stats[user_id_str] = {
+            "bombs": 0,
+            "otps_sent": 0,
+            "authorized_at": datetime.now()
+        }
+
+def update_bomb_stats(user_id, otp_count):
+    """Update bombing statistics"""
+    user_id_str = str(user_id)
+    if user_id_str in user_stats:
+        user_stats[user_id_str]["bombs"] += 1
+        user_stats[user_id_str]["otps_sent"] += otp_count
+    global_stats["total_bombs"] += 1
+    global_stats["total_otps_sent"] += otp_count
+
 async def make_api_call(session, config, phone):
     """Make a single API call"""
     try:
@@ -110,27 +148,129 @@ async def send_otp_wave(phone, callback=None):
         
         return results
 
-# ===== BOT COMMAND HANDLERS =====
+# ===== AUTHORIZATION HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
-    welcome_msg = (
-        "🤖 *OTP Tester Bot - Educational Purpose*\n\n"
-        "⚠️ *WARNING:* This bot is for educational testing only!\n"
-        "✅ Only use on YOUR OWN phone number\n"
-        "❌ Misuse is illegal and unethical\n\n"
-        "*Commands:*\n"
-        "/start - Show this message\n"
-        "/test <number> - Test OTP on a number\n"
-        "/bomb <number> <count> - Send multiple OTPs\n"
-        "/stop - Stop active session\n"
-        "/status - Check active sessions\n"
-        "/help - Show help\n\n"
-        "Send a 10-digit phone number to begin."
-    )
-    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+    user_id = update.effective_user.id
+    
+    if is_authorized(user_id):
+        welcome_msg = (
+            "🤖 *OTP Tester Bot - Educational Purpose*\n\n"
+            "✅ You are authorized!\n\n"
+            "⚠️ *WARNING:* This bot is for educational testing only!\n"
+            "✅ Only use on YOUR OWN phone number\n"
+            "❌ Misuse is illegal and unethical\n\n"
+            "*Commands:*\n"
+            "/start - Show this message\n"
+            "/test <number> - Test OTP on a number\n"
+            "/bomb <number> <count> - Send multiple OTPs\n"
+            "/stop - Stop active session\n"
+            "/status - Check active sessions\n"
+            "/stats - View your statistics\n"
+            "/help - Show help\n\n"
+            "Send a 10-digit phone number to begin."
+        )
+        await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+    else:
+        if not ACCESS_CODE:
+            # If no access code set, authorize everyone
+            authorize_user(user_id)
+            await start(update, context)
+            return
+        
+        welcome_msg = (
+            "🔐 *Access Code Required*\n\n"
+            "This bot requires an access code to use.\n"
+            "Please enter the access code to continue:\n\n"
+            "❌ Cancel - /cancel"
+        )
+        await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+        return WAITING_FOR_CODE
 
+async def check_access_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if entered access code is correct"""
+    user_id = update.effective_user.id
+    code = update.message.text.strip()
+    
+    if code == ACCESS_CODE:
+        authorize_user(user_id)
+        await update.message.reply_text(
+            "✅ *Access Granted!*\n\n"
+            "You are now authorized to use the bot.\n"
+            "Send /start to see available commands.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "❌ *Incorrect Access Code!*\n\n"
+            "Please try again or contact the admin.\n"
+            "Cancel - /cancel",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CODE
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel access code entry"""
+    await update.message.reply_text(
+        "❌ Cancelled. You need an access code to use this bot.\n"
+        "Send /start to try again."
+    )
+    return ConversationHandler.END
+
+# ===== STATS COMMAND =====
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show statistics"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
+    user_id_str = str(user_id)
+    is_admin = user_id_str in ADMIN_USER_IDS
+    
+    # User stats
+    user_data = user_stats.get(user_id_str, {})
+    user_bombs = user_data.get("bombs", 0)
+    user_otps = user_data.get("otps_sent", 0)
+    auth_date = user_data.get("authorized_at", datetime.now())
+    
+    stats_msg = f"📊 *Your Statistics*\n\n"
+    stats_msg += f"💣 Total Bombs: {user_bombs}\n"
+    stats_msg += f"📱 Total OTPs Sent: {user_otps}\n"
+    stats_msg += f"📅 Authorized Since: {auth_date.strftime('%Y-%m-%d %H:%M')}\n"
+    
+    # Admin gets global stats
+    if is_admin:
+        uptime = datetime.now() - global_stats["bot_started_at"]
+        hours = int(uptime.total_seconds() // 3600)
+        minutes = int((uptime.total_seconds() % 3600) // 60)
+        
+        stats_msg += f"\n🔧 *Admin Statistics*\n\n"
+        stats_msg += f"👥 Authorized Users: {len(authorized_users)}\n"
+        stats_msg += f"💣 Total Bombs (All Users): {global_stats['total_bombs']}\n"
+        stats_msg += f"📱 Total OTPs (All Users): {global_stats['total_otps_sent']}\n"
+        stats_msg += f"⏱️ Bot Uptime: {hours}h {minutes}m\n"
+        
+        # Top users
+        if user_stats:
+            sorted_users = sorted(user_stats.items(), key=lambda x: x[1]["bombs"], reverse=True)[:5]
+            stats_msg += f"\n🏆 *Top 5 Users:*\n"
+            for idx, (uid, data) in enumerate(sorted_users, 1):
+                stats_msg += f"{idx}. User {uid[:8]}... - {data['bombs']} bombs\n"
+    
+    await update.message.reply_text(stats_msg, parse_mode="Markdown")
+
+# ===== BOT COMMAND HANDLERS =====
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
     help_msg = (
         "*How to use:*\n\n"
         "1️⃣ Send a 10-digit phone number (without +91)\n"
@@ -145,6 +285,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test single OTP wave"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
     if len(context.args) != 1:
         await update.message.reply_text("Usage: /test <phone_number>")
         return
@@ -167,10 +313,18 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await msg.edit_text(result_text, parse_mode="Markdown")
     
-    await send_otp_wave(phone, callback)
+    results = await send_otp_wave(phone, callback)
+    success_count = sum(1 for r in results if r["success"])
+    update_bomb_stats(user_id, success_count)
 
 async def bomb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send multiple OTP waves"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
     if len(context.args) != 2:
         await update.message.reply_text("Usage: /bomb <phone_number> <count>")
         return
@@ -189,8 +343,6 @@ async def bomb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not phone.isdigit() or len(phone) != 10:
         await update.message.reply_text("❌ Invalid phone number! Must be 10 digits.")
         return
-    
-    user_id = update.effective_user.id
     
     # Store session
     active_sessions[user_id] = {"phone": phone, "active": True}
@@ -219,10 +371,12 @@ async def bomb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_otp_wave(phone, callback)
         
         if i < count - 1:
-            await asyncio.sleep(2)  # 2 second delay between waves
+            await asyncio.sleep(2)
     
     if user_id in active_sessions:
         del active_sessions[user_id]
+    
+    update_bomb_stats(user_id, total_success)
     
     await msg.edit_text(
         f"✅ Completed {count} waves for {phone}\n"
@@ -232,6 +386,10 @@ async def bomb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stop active bombing session"""
     user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
     
     if user_id in active_sessions:
         active_sessions[user_id]["active"] = False
@@ -243,6 +401,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check status"""
     user_id = update.effective_user.id
     
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
     if user_id in active_sessions and active_sessions[user_id]["active"]:
         phone = active_sessions[user_id]["phone"]
         await update.message.reply_text(f"🔄 Active session for: {phone}")
@@ -251,6 +413,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle plain text messages (phone numbers)"""
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You need to authorize first! Send /start")
+        return
+    
     text = update.message.text.strip()
     
     if text.isdigit() and len(text) == 10:
@@ -280,6 +448,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
+    user_id = update.effective_user.id
+    
+    if not is_authorized(user_id):
+        await query.edit_message_text("❌ You need to authorize first! Send /start")
+        return
+    
     data = query.data
     
     if data == "cancel":
@@ -303,11 +477,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.edit_message_text(result_text, parse_mode="Markdown")
         
-        await send_otp_wave(phone, callback)
+        results = await send_otp_wave(phone, callback)
+        success_count = sum(1 for r in results if r["success"])
+        update_bomb_stats(user_id, success_count)
     
     elif action == "bomb":
         count = int(parts[2])
-        user_id = update.effective_user.id
         active_sessions[user_id] = {"phone": phone, "active": True}
         
         await query.edit_message_text(f"🚀 Starting {count} waves...")
@@ -336,6 +511,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in active_sessions:
             del active_sessions[user_id]
         
+        update_bomb_stats(user_id, total_success)
+        
         await query.edit_message_text(f"✅ Completed {count} waves!\n📊 Success: {total_success}")
 
 # ===== ERROR HANDLER =====
@@ -354,29 +531,46 @@ def main():
     print("🤖 Starting OTP Tester Bot...")
     print(f"🌐 Port: {PORT}")
     print(f"🔗 Webhook: {WEBHOOK_URL if WEBHOOK_URL else 'Polling mode'}")
+    print(f"🔐 Access Code: {'Enabled' if ACCESS_CODE else 'Disabled (Open Access)'}")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
+    # Conversation handler for access code
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            WAITING_FOR_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_access_code)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    
     # Add handlers
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("test", test_command))
     app.add_handler(CommandHandler("bomb", bomb_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     
     # Use webhook for Railway, polling for local
     if WEBHOOK_URL:
-        print("✅ Running in webhook mode (Railway)")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            url_path=BOT_TOKEN
-        )
+        try:
+            print("✅ Running in webhook mode (Railway)")
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+                url_path=BOT_TOKEN,
+                allowed_updates=Update.ALL_TYPES
+            )
+        except Exception as e:
+            print(f"❌ Webhook error: {e}")
+            print("🔄 Falling back to polling mode...")
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
     else:
         print("✅ Running in polling mode (Local)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
